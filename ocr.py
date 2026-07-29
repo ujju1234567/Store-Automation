@@ -39,7 +39,7 @@ def _as_list(value):
     if isinstance(value, np.ndarray):
         return value.tolist()
     if isinstance(value, (list, tuple)):
-        return list(value)
+        return [item.tolist() if isinstance(item, np.ndarray) else item for item in value]
     return [value]
 
 
