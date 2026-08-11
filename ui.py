@@ -78,14 +78,14 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ─── Processing version guard & session init ──────────────────────────────────
-PROCESSING_VERSION = 6
+PROCESSING_VERSION = 7
 if st.session_state.get("processing_version") != PROCESSING_VERSION:
     st.session_state.processing_version = PROCESSING_VERSION
     st.session_state.step = 0
     st.session_state.docs = []
     st.session_state.pending_items = []
     st.session_state.camera_db_folder = r"C:\Users\shailesh\Documents\InspectionImages"
-    st.session_state.scanner_inbox = r"C:\ScanInbox"
+    st.session_state.scanner_inbox = r"C:\Users\shailesh\Documents\ScanInbox"
 
 if "step" not in st.session_state:
     st.session_state.step = 0
@@ -95,14 +95,17 @@ if "pending_items" not in st.session_state:
     st.session_state.pending_items = []
 if "camera_db_folder" not in st.session_state:
     st.session_state.camera_db_folder = r"C:\Users\shailesh\Documents\InspectionImages"
-if "scanner_inbox" not in st.session_state:
+if "scanner_inbox" not in st.session_state or st.session_state.scanner_inbox == r"C:\ScanInbox":
     st.session_state.scanner_inbox = r"C:\Users\shailesh\Documents\ScanInbox"
 
 
 # ─── File & Camera Saving Helpers ──────────────────────────────────────────────
 def save_image_to_db(pil_image: Image.Image, doc_type: str, folder: str) -> str:
     """Save a PIL image to the target folder with timestamped filename."""
-    os.makedirs(folder, exist_ok=True)
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except Exception as e:
+        print(f"[Warning] Cannot create directory {folder}: {e}")
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_type = doc_type.replace(" ", "_").replace("(", "").replace(")", "").replace("/", "-")
     filename = f"{safe_type}_{ts}.png"
