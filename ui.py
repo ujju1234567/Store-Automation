@@ -89,28 +89,49 @@ def save_image_to_db(pil_image: Image.Image, doc_type: str, folder: str) -> str:
     return filepath
 
 
+# Engine display labels / colours
+_ENGINE_LABELS = {
+    "paddle":      ("🟢 PaddleOCR",  "#00c853"),
+    "tesseract":   ("🔵 Tesseract",  "#2196f3"),
+    "paddle_only": ("🟢 PaddleOCR",  "#00c853"),
+}
+
+
 def _run_ocr_and_extract(images, doc_type):
     """Core OCR + field extraction for a list of images."""
     all_text = ""
     all_elements = []
     total_conf = 0.0
+    engine_counts: dict = {}
 
     for i, img in enumerate(images):
-        text, elements, conf = perform_ocr(img)
+        result = perform_ocr(img)
+        # Support both old 3-tuple and new 4-tuple return
+        if len(result) == 4:
+            text, elements, conf, engine = result
+        else:
+            text, elements, conf = result
+            engine = "paddle_only"
+
         all_text += f"\n--- Page {i+1} ---\n{text}"
         all_elements.extend(elements)
         total_conf += conf
+        engine_counts[engine] = engine_counts.get(engine, 0) + 1
 
     overall_conf = (total_conf / len(images)) if images else 0.0
+    # Primary engine = whichever engine handled most pages
+    primary_engine = max(engine_counts, key=engine_counts.get) if engine_counts else "paddle_only"
     extraction = extract_fields(all_text)
 
     return {
-        "type":       doc_type,
-        "images":     images,
-        "raw_text":   all_text,
-        "elements":   all_elements,
-        "confidence": overall_conf,
-        "extraction": extraction,
+        "type":        doc_type,
+        "images":      images,
+        "raw_text":    all_text,
+        "elements":    all_elements,
+        "confidence":  overall_conf,
+        "extraction":  extraction,
+        "engine":      primary_engine,
+        "engine_counts": engine_counts,
     }
 
 
@@ -300,7 +321,7 @@ else:
     # ── Run Parallel OCR Processing if pending ────────────────────────────────
     if st.session_state.pending_items:
         n_items = len(st.session_state.pending_items)
-        with st.status(f"🚀 Running Parallel PaddleOCR on {n_items} document(s)...", expanded=True) as status:
+        with st.status(f"🚀 Running Adaptive OCR (PaddleOCR + Tesseract) on {n_items} document(s)...", expanded=True) as status:
             processed_results = [None] * n_items
             
             # Execute OCR in parallel threads
@@ -318,7 +339,8 @@ else:
                         processed_results[idx] = res
                         doc_name = res["type"]
                         n_lines = len(res["elements"])
-                        st.write(f"✅ Completed OCR for **{doc_name}** ({n_lines} text lines extracted)")
+                        engine_label, _ = _ENGINE_LABELS.get(res.get("engine", "paddle_only"), ("🟢 PaddleOCR", "#00c853"))
+                        st.write(f"✅ **{doc_name}** — {n_lines} text elements extracted via {engine_label} (confidence: {res['confidence']:.1%})")
                     except Exception as e:
                         st.write(f"❌ Error processing document #{idx+1}: {e}")
 
@@ -329,7 +351,7 @@ else:
             
             # Clear pending queue
             st.session_state.pending_items = []
-            status.update(label="🎉 All OCR processing completed in parallel!", state="complete", expanded=False)
+            status.update(label="🎉 All OCR processing completed (adaptive dual-engine)!", state="complete", expanded=False)
 
     if not st.session_state.docs:
         st.error("No documents were uploaded or captured.")
@@ -379,14 +401,32 @@ else:
     st.markdown("#### 🔍 OCR Text & Image Analysis (Per Document)")
     for doc in st.session_state.docs:
         source_badge = "📷 Camera" if doc.get("source") == "camera" else "📂 Upload"
+        engine_key = doc.get("engine", "paddle_only")
+        engine_label, engine_color = _ENGINE_LABELS.get(engine_key, ("🟢 PaddleOCR", "#00c853"))
         with st.expander(
             f"{source_badge} | 📄 {doc['type']} — {len(doc['elements'])} lines "
-            f"(confidence: {doc['confidence']:.1%})"
+            f"(confidence: {doc['confidence']:.1%}) | {engine_label}"
         ):
-            metric_a, metric_b, metric_c = st.columns(3)
+            metric_a, metric_b, metric_c, metric_d = st.columns(4)
             metric_a.metric("Text elements", len(doc["elements"]))
             metric_b.metric("OCR confidence", f"{doc['confidence']:.1%}")
             metric_c.metric("Pages / Images", len(doc["images"]))
+            metric_d.metric("OCR engine", engine_label)
+
+            # Show engine breakdown if multiple pages used different engines
+            engine_counts = doc.get("engine_counts", {})
+            if len(engine_counts) > 1:
+                breakdown = ", ".join(
+                    f"{_ENGINE_LABELS.get(e, (e, ''))[0]}: {c} page(s)"
+                    for e, c in engine_counts.items()
+                )
+                st.info(f"🔀 **Adaptive OCR per-page breakdown:** {breakdown}")
+            elif engine_key == "tesseract":
+                st.info("🔵 **Tesseract was used** — PaddleOCR confidence was below threshold on this document.")
+            elif engine_key == "paddle":
+                st.success("🟢 **PaddleOCR** delivered high-confidence results — no fallback needed.")
+            else:
+                st.info("🟢 **PaddleOCR** — Tesseract not installed; running in Paddle-only mode.")
 
             if doc.get("saved_path"):
                 st.markdown(f"💾 Saved to database: `{doc['saved_path']}`")
@@ -399,14 +439,14 @@ else:
                 ]
                 if boxes:
                     annotated = draw_ocr_boxes(doc["images"][0], boxes)
-                    st.image(annotated, caption=f"PaddleOCR Bounding Boxes — {doc['type']}", use_container_width=True)
+                    st.image(annotated, caption=f"{engine_label} Bounding Boxes — {doc['type']}", use_container_width=True)
                 else:
                     st.image(doc["images"][0], caption=f"Captured Image — {doc['type']}", use_container_width=True)
 
             if doc["elements"]:
                 st.code(doc["raw_text"], language=None)
             else:
-                st.error("PaddleOCR returned no text for this document. Verify readable content.")
+                st.error("OCR returned no text for this document. Verify readable content.")
 
             extracted = {
                 field.replace("_", " ").title(): value

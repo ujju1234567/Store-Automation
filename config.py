@@ -14,3 +14,11 @@ ENABLE_AI_EXTRACTION = False
 PDF_DPI = 120
 CONFIDENCE_THRESHOLD_WARNING = 0.85
 CONFIDENCE_THRESHOLD_DANGER = 0.60
+
+# ── Adaptive dual-engine OCR settings ────────────────────────────────────────
+# If PaddleOCR's mean confidence falls below this value, Tesseract is also run
+# and the higher-confidence result is kept.  Range: 0.0 – 1.0.
+OCR_CONFIDENCE_THRESHOLD = 0.80
+
+# Optional: explicit path to the Tesseract binary (leave empty for auto-detect)
+TESSERACT_PATH = os.getenv("TESSERACT_PATH", "")
