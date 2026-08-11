@@ -11,18 +11,19 @@
 $ErrorActionPreference = "Stop"
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-$VERSION       = "5.5.3"
-$BUILD_DATE    = "20260724"
+$VERSION       = "5.4.0"
+$BUILD_DATE    = "20240606"
+$TAG           = "v${VERSION}.${BUILD_DATE}"          # UB-Mannheim uses 'v' prefix in tag
 $INSTALLER_EXE = "tesseract-ocr-w64-setup-${VERSION}.${BUILD_DATE}.exe"
-$INSTALLER_URL = "https://github.com/tesseract-ocr/tesseract/releases/download/${VERSION}.${BUILD_DATE}/${INSTALLER_EXE}"
+$INSTALLER_URL = "https://github.com/UB-Mannheim/tesseract/releases/download/${TAG}/${INSTALLER_EXE}"
 $INSTALL_DIR   = "C:\Program Files\Tesseract-OCR"
 $INSTALLER     = "$env:TEMP\$INSTALLER_EXE"
 $TESSDATA_DIR  = Join-Path $INSTALL_DIR "tessdata"
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "  Tesseract OCR $VERSION Windows Installer" -ForegroundColor Cyan
-Write-Host "  Source : github.com/tesseract-ocr/tesseract (official)" -ForegroundColor Cyan
+Write-Host "  Tesseract OCR $VERSION (build $BUILD_DATE) Windows Installer" -ForegroundColor Cyan
+Write-Host "  Source : github.com/UB-Mannheim/tesseract (official Windows build)" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host ""
 
