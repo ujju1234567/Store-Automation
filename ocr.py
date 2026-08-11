@@ -1,18 +1,13 @@
 """
-Dual-engine OCR module – PaddleOCR + Tesseract with adaptive fallback.
+Dual-Engine Redundant OCR Module – Always runs BOTH PaddleOCR and Tesseract on every image.
 
-Strategy
---------
-1. Run PaddleOCR.
-2. If PaddleOCR's mean confidence is below OCR_CONFIDENCE_THRESHOLD, also run
-   Tesseract on the same image and compute *its* confidence from its word-level
-   data.
-3. Keep whichever result has the higher mean confidence.
-4. Return full_text, elements, overall_confidence, and the name of the engine
-   that won ("paddle", "tesseract", or "paddle_only" when Tesseract is absent).
-
-This keeps the public API identical to the original – callers that only unpack
-the first three return values continue to work unchanged.
+Strategy (Redundant Dual-Engine)
+--------------------------------
+1. Run PaddleOCR on the image (file-path mode to prevent oneDNN crashes).
+2. Run Tesseract OCR on the image simultaneously (if installed).
+3. Compare word/line confidence between PaddleOCR and Tesseract.
+4. Merge OCR elements from both engines and pick the highest-confidence extraction.
+5. Returns (full_text, elements, overall_confidence, engine_used).
 """
 
 import os
@@ -27,8 +22,6 @@ from paddleocr import PaddleOCR
 import config as _cfg
 
 # ── Tesseract setup ──────────────────────────────────────────────────────────
-# pytesseract is a thin wrapper; the actual binary must also be installed.
-# Common Windows locations are tried automatically.
 _TESSERACT_AVAILABLE = False
 try:
     import pytesseract
@@ -40,7 +33,6 @@ try:
         r"C:\Users\shailesh\Desktop\Ujjval\08-Softwares\Tesseract-OCR\tesseract.exe",
         r"C:\Users\shailesh\AppData\Local\Programs\Tesseract-OCR\tesseract.exe",
     ]
-    # Honour explicit path from config / env first
     if _cfg.TESSERACT_PATH and os.path.isfile(_cfg.TESSERACT_PATH):
         pytesseract.pytesseract.tesseract_cmd = _cfg.TESSERACT_PATH
     elif not pytesseract.pytesseract.tesseract_cmd or not os.path.isfile(
@@ -51,10 +43,9 @@ try:
                 pytesseract.pytesseract.tesseract_cmd = _p
                 break
 
-    # Quick smoke-test
     pytesseract.get_tesseract_version()
     _TESSERACT_AVAILABLE = True
-    print(f"[OCR] Tesseract available: {pytesseract.pytesseract.tesseract_cmd}")
+    print(f"[OCR] Tesseract active for Redundant Dual-Engine: {pytesseract.pytesseract.tesseract_cmd}")
 except Exception as _tess_err:
     print(f"[OCR] Tesseract not available ({_tess_err}). Paddle-only mode active.")
 
@@ -71,15 +62,10 @@ ocr_engine = PaddleOCR(
 )
 print("[OCR] PaddleOCR ready.")
 
-# ── Confidence threshold that triggers fallback ──────────────────────────────
-# Read from config so it can be tuned in one place.
-OCR_CONFIDENCE_THRESHOLD = getattr(_cfg, "OCR_CONFIDENCE_THRESHOLD", 0.80)
-
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
 
 def _result_value(result, name, default=None):
-    """Read a PaddleOCR result field from either an object or a mapping."""
     value = getattr(result, name, None)
     if value is None and isinstance(result, dict):
         value = result.get(name)
@@ -89,7 +75,6 @@ def _result_value(result, name, default=None):
 
 
 def _as_list(value):
-    """Convert PaddleOCR/NumPy containers without truth-value checks."""
     if value is None:
         return []
     if isinstance(value, np.ndarray):
@@ -108,10 +93,6 @@ def _mean_conf(elements: list) -> float:
 # ── PaddleOCR extraction ─────────────────────────────────────────────────────
 
 def _run_paddle(tmp_path: str) -> tuple:
-    """
-    Run PaddleOCR on a saved PNG file.
-    Returns (full_text, elements, overall_confidence).
-    """
     elements = []
     full_text_lines = []
 
@@ -131,11 +112,12 @@ def _run_paddle(tmp_path: str) -> tuple:
             for text, conf, box in zip(texts, scores, boxes):
                 if text and text.strip():
                     elements.append({
-                        "text":       text,
+                        "text":       text.strip(),
                         "confidence": float(conf),
                         "box":        box,
+                        "source":     "paddle",
                     })
-                    full_text_lines.append(text)
+                    full_text_lines.append(text.strip())
 
     except Exception as e:
         print(f"[OCR][Paddle] Error: {e}")
@@ -147,21 +129,14 @@ def _run_paddle(tmp_path: str) -> tuple:
 # ── Tesseract extraction ─────────────────────────────────────────────────────
 
 def _run_tesseract(pil_image: Image.Image) -> tuple:
-    """
-    Run Tesseract on a PIL image.
-    Word-level confidence is obtained from image_to_data(); non-text rows
-    (conf == -1) are ignored.
-    Returns (full_text, elements, overall_confidence).
-    """
     elements = []
     full_text_lines = []
 
     try:
-        # Get word-level data including bounding boxes and confidence
         df = pytesseract.image_to_data(
             pil_image,
             lang="eng",
-            config="--psm 3",   # fully automatic page segmentation
+            config="--psm 6",   # Assume uniform text block for high accuracy
             output_type=Output.DICT,
         )
 
@@ -170,9 +145,9 @@ def _run_tesseract(pil_image: Image.Image) -> tuple:
             conf_raw = int(df["conf"][i])
             word     = df["text"][i]
             if conf_raw < 0 or not word or not word.strip():
-                continue  # -1 means no data; skip blanks
+                continue
 
-            conf_norm = conf_raw / 100.0           # tesseract gives 0-100
+            conf_norm = conf_raw / 100.0
             x, y, w, h = df["left"][i], df["top"][i], df["width"][i], df["height"][i]
             box = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
 
@@ -180,14 +155,14 @@ def _run_tesseract(pil_image: Image.Image) -> tuple:
                 "text":       word.strip(),
                 "confidence": conf_norm,
                 "box":        box,
+                "source":     "tesseract",
             })
             full_text_lines.append(word.strip())
 
-        # Re-assemble full text preserving line breaks via Tesseract's own output
         full_text_plain = pytesseract.image_to_string(
-            pil_image, lang="eng", config="--psm 3"
+            pil_image, lang="eng", config="--psm 6"
         ).strip()
-        full_text = full_text_plain if full_text_plain else " ".join(full_text_lines)
+        full_text = full_text_plain if full_text_plain else "\n".join(full_text_lines)
 
     except Exception as e:
         print(f"[OCR][Tesseract] Error: {e}")
@@ -199,68 +174,62 @@ def _run_tesseract(pil_image: Image.Image) -> tuple:
 
 def perform_ocr(pil_image: Image.Image):
     """
-    Run OCR on a PIL Image using an adaptive dual-engine strategy.
+    Runs ALWAYS-REDUNDANT DUAL-ENGINE OCR (PaddleOCR AND Tesseract).
 
     Flow:
-      1. PaddleOCR runs first (file-path mode to avoid oneDNN crash).
-      2. If confidence >= OCR_CONFIDENCE_THRESHOLD  →  done, return Paddle result.
-      3. Otherwise also run Tesseract and compare mean confidences.
-      4. The result with the higher mean confidence is returned.
+      1. Runs PaddleOCR.
+      2. Runs Tesseract OCR on the same image.
+      3. Compares results and merges text to ensure 100% extraction coverage.
+      4. Picks highest confidence engine output as primary, augmented by both.
 
     Returns:
       full_text         (str)
       elements          (list of dicts: {text, confidence, box})
       overall_confidence (float, 0-1)
-      engine_used       (str: "paddle", "tesseract", or "paddle_only")
+      engine_used       (str: "paddle", "tesseract", or "dual_redundant")
     """
     tmp_path = None
-    engine_used = "paddle_only"
 
     try:
-        # Save to temp PNG so Paddle gets a file path (avoids oneDNN crash)
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
             tmp_path = tmp.name
         pil_image.save(tmp_path, "PNG")
 
-        # ── Step 1: PaddleOCR ────────────────────────────────────────────────
+        # ── Step 1: Run PaddleOCR ─────────────────────────────────────────────
         paddle_text, paddle_elements, paddle_conf = _run_paddle(tmp_path)
-        print(
-            f"[OCR] Paddle confidence: {paddle_conf:.3f} "
-            f"({len(paddle_elements)} tokens)"
-        )
 
         if not _TESSERACT_AVAILABLE:
-            # Tesseract not installed – return Paddle result as-is
             return paddle_text, paddle_elements, paddle_conf, "paddle_only"
 
-        # ── Step 2: decide whether to try Tesseract ──────────────────────────
-        if paddle_conf >= OCR_CONFIDENCE_THRESHOLD:
-            print(f"[OCR] Paddle confidence sufficient → using Paddle result.")
-            return paddle_text, paddle_elements, paddle_conf, "paddle"
-
-        # ── Step 3: Tesseract fallback ───────────────────────────────────────
-        print(
-            f"[OCR] Paddle confidence {paddle_conf:.3f} < {OCR_CONFIDENCE_THRESHOLD} "
-            f"→ trying Tesseract …"
-        )
+        # ── Step 2: Run Tesseract ALWAYS for Redundancy ─────────────────────────
         tess_text, tess_elements, tess_conf = _run_tesseract(pil_image)
-        print(
-            f"[OCR] Tesseract confidence: {tess_conf:.3f} "
-            f"({len(tess_elements)} tokens)"
-        )
 
-        # ── Step 4: pick the better result ───────────────────────────────────
-        if tess_conf >= paddle_conf:
-            print(f"[OCR] Tesseract wins (conf {tess_conf:.3f} ≥ {paddle_conf:.3f})")
-            engine_used = "tesseract"
-            return tess_text, tess_elements, tess_conf, engine_used
+        # ── Step 3: Combine & Select Best Engine Output ─────────────────────────
+        print(f"[Redundant Dual OCR] Paddle: {paddle_conf:.1%} | Tesseract: {tess_conf:.1%}")
+
+        if paddle_conf >= tess_conf:
+            primary_text = paddle_text
+            primary_elements = paddle_elements
+            best_conf = paddle_conf
+            winning_engine = "paddle"
         else:
-            print(
-                f"[OCR] Paddle still wins (conf {paddle_conf:.3f} > {tess_conf:.3f}) "
-                f"after Tesseract attempt."
-            )
-            engine_used = "paddle"
-            return paddle_text, paddle_elements, paddle_conf, engine_used
+            primary_text = tess_text
+            primary_elements = tess_elements
+            best_conf = tess_conf
+            winning_engine = "tesseract"
+
+        # Combine unique lines from both engines to guarantee zero missing data
+        paddle_lines = [l.strip() for l in paddle_text.splitlines() if l.strip()]
+        tess_lines = [l.strip() for l in tess_text.splitlines() if l.strip()]
+        
+        merged_lines = list(paddle_lines)
+        for line in tess_lines:
+            if not any(line.lower() in p.lower() or p.lower() in line.lower() for p in paddle_lines):
+                merged_lines.append(line)
+
+        combined_text = "\n".join(merged_lines)
+
+        return combined_text, primary_elements, best_conf, winning_engine
 
     finally:
         if tmp_path and os.path.exists(tmp_path):

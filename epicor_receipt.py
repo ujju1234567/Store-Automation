@@ -53,10 +53,10 @@ def generate_epicor_dmt_receipt_csv(docs: list, po_number: str, output_path: str
     po_ext = po_doc["extraction"] if po_doc else None
     
     company = "100" # Default EPICOR Company ID
-    vendor_name = po_ext.vendor_name if po_ext else "SUPPLIER"
-    part_num = po_ext.part_number if po_ext else "PART-001"
-    qty = po_ext.quantity if po_ext else "1"
-    unit_price = po_ext.unit_price if po_ext else "0.0"
+    vendor_name = getattr(po_ext, "supplier_name", None) if po_ext else "SUPPLIER"
+    part_num = getattr(po_ext, "part_number", None) if po_ext else "PART-001"
+    qty = getattr(po_ext, "quantity", None) if po_ext else "1"
+    unit_price = getattr(po_ext, "unit_price", None) if po_ext else "0.0"
     receipt_date = datetime.datetime.now().strftime("%Y-%m-%d")
     
     rows = [
