@@ -74,11 +74,18 @@ st.markdown("""
         color: white;
         margin: 1rem 0;
     }
+    .field-card {
+        background: rgba(255, 255, 255, 0.03);
+        border-radius: 8px;
+        padding: 0.8rem;
+        margin-top: 0.4rem;
+        border-left: 4px solid #38bdf8;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 # ─── Processing version guard & session init ──────────────────────────────────
-PROCESSING_VERSION = 7
+PROCESSING_VERSION = 8
 if st.session_state.get("processing_version") != PROCESSING_VERSION:
     st.session_state.processing_version = PROCESSING_VERSION
     st.session_state.step = 0
@@ -167,12 +174,10 @@ def process_single_item(item):
         file_obj_or_path = item["file"]
         
         if isinstance(file_obj_or_path, str):
-            # Scanner file path
             tmp_path = file_obj_or_path
             ext = os.path.splitext(tmp_path)[1].lower()
             cleanup_tmp = False
         else:
-            # Uploaded File object
             uploaded_file = file_obj_or_path
             ext = os.path.splitext(uploaded_file.name)[1].lower()
             with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
@@ -405,7 +410,7 @@ else:
     # ── Run Parallel OCR Processing if pending ────────────────────────────────
     if st.session_state.pending_items:
         n_items = len(st.session_state.pending_items)
-        with st.status(f"🚀 Running Adaptive Dual-Engine OCR (PaddleOCR + Tesseract) on {n_items} document(s)...", expanded=True) as status:
+        with st.status(f"🚀 Running Redundant Dual-Engine OCR (PaddleOCR + Tesseract) on {n_items} document(s)...", expanded=True) as status:
             processed_results = [None] * n_items
             
             max_workers = min(4, n_items)
@@ -420,10 +425,6 @@ else:
                     try:
                         res = future.result()
                         processed_results[idx] = res
-                        doc_name = res["type"]
-                        n_lines = len(res["elements"])
-                        engine_label, _ = _ENGINE_LABELS.get(res.get("engine", "paddle_only"), ("🟢 PaddleOCR", "#00c853"))
-                        st.write(f"✅ **{doc_name}** — {n_lines} text elements extracted via {engine_label} (confidence: {res['confidence']:.1%})")
                     except Exception as e:
                         st.write(f"❌ Error processing document #{idx+1}: {e}")
 
@@ -432,7 +433,7 @@ else:
                     st.session_state.docs.append(r)
             
             st.session_state.pending_items = []
-            status.update(label="🎉 All OCR processing completed (adaptive dual-engine)!", state="complete", expanded=False)
+            status.update(label="🎉 All OCR processing completed (redundant dual-engine)!", state="complete", expanded=False)
 
     if not st.session_state.docs:
         st.error("No documents were uploaded or captured.")
@@ -441,7 +442,41 @@ else:
     po_doc = next((d for d in st.session_state.docs if d["type"] == "Purchase Order"), None)
     po_number = po_doc["extraction"].po_number if po_doc else "12345"
 
-    # ── 1. Document Comparison & High-Precision Match Analysis ───────────────
+    # ── UX Request 1: Interactive Click-to-Expand OCR Document Cards ─────────
+    st.markdown("### 📑 Processed OCR Documents (Click to Expand Text & Download)")
+    for doc_idx, doc in enumerate(st.session_state.docs):
+        source_badge = "🖨️ Scanner" if doc.get("source") == "scanner" else ("📷 Camera" if doc.get("source") == "camera" else "📂 Upload")
+        engine_key = doc.get("engine", "paddle_only")
+        engine_label, _ = _ENGINE_LABELS.get(engine_key, ("🟢 PaddleOCR", "#00c853"))
+        
+        with st.expander(
+            f"✅ {doc['type']} — {len(doc['elements'])} text elements extracted via {engine_label} (confidence: {doc['confidence']:.1%})",
+            expanded=False
+        ):
+            c_txt, c_dl = st.columns([7, 3])
+            with c_txt:
+                st.markdown(f"**Source:** {source_badge} | **OCR Engine:** {engine_label}")
+            with c_dl:
+                st.download_button(
+                    label=f"📥 Download {doc['type']} OCR (.txt)",
+                    data=doc["raw_text"],
+                    file_name=f"{doc['type'].replace(' ', '_')}_raw_ocr.txt",
+                    mime="text/plain",
+                    key=f"dl_txt_{doc_idx}"
+                )
+            
+            st.markdown("**Detected OCR Raw Text:**")
+            st.code(doc["raw_text"], language=None)
+            
+            if doc.get("images"):
+                boxes = [el["box"] for el in doc["elements"] if el.get("box") and len(el["box"]) > 0]
+                if boxes:
+                    annotated = draw_ocr_boxes(doc["images"][0], boxes)
+                    st.image(annotated, caption=f"{engine_label} Bounding Box Localization", use_container_width=True)
+
+    st.divider()
+
+    # ── UX Request 2: Click-to-Expand Layout for Word-for-Word Comparison ────
     st.markdown("### 🔍 High-Precision Document Matching & Word-for-Word Analysis")
     
     is_overall_approved = True
@@ -450,8 +485,8 @@ else:
     if po_doc:
         supporting_docs = [d for d in st.session_state.docs if d["type"] != "Purchase Order"]
         if supporting_docs:
-            for supp_doc in supporting_docs:
-                st.subheader(f"📄 PO vs {supp_doc['type']}")
+            for supp_idx, supp_doc in enumerate(supporting_docs):
+                st.subheader(f"📄 Purchase Order vs {supp_doc['type']}")
                 results = compare_documents(po_doc["extraction"], supp_doc["extraction"])
                 summary = results.pop("_summary", {})
                 
@@ -465,14 +500,33 @@ else:
                 col_m1.metric("Similarity Matching Confidence", f"{match_pct:.1f}%")
                 col_m2.metric("Compliance Status", "✅ APPROVED" if approved else "❌ REJECTED")
 
-                # Field details
-                for field, data in results.items():
+                st.markdown("#### 🔍 Detailed Field Matching Analysis (Click any field to expand)")
+                
+                # Render each comparison field as an interactive expander card
+                for field_name, data in results.items():
                     status_flag = data["status"]
-                    icon = "✅" if status_flag == "match" else "⚠️" if "partial" in status_flag else "❌"
-                    st.markdown(
-                        f"**{field.replace('_', ' ').title()}**: {icon} {data['detail']} "
-                        f"(PO: *{data['base'] or 'Not found'}* | Doc: *{data['supporting'] or 'Not found'}*)"
-                    )
+                    icon = "✅" if status_flag == "match" else "⚠️" if "partial" in status_flag else "❌" if status_flag == "mismatch" else "ℹ️"
+                    title_field = field_name.replace("_", " ").title()
+                    
+                    po_val_str = str(data['base']) if data['base'] is not None else "Not found"
+                    doc_val_str = str(data['supporting']) if data['supporting'] is not None else "Not found"
+                    score_str = f"{data.get('similarity_score', 0.0)}%"
+
+                    expander_header = f"{icon} **{title_field}** — {data['detail']} (PO: `{po_val_str}` | Doc: `{doc_val_str}`)"
+                    
+                    with st.expander(expander_header, expanded=(status_flag in ["mismatch", "partial_match"])):
+                        m_col1, m_col2, m_col3 = st.columns(3)
+                        m_col1.metric("PO Value Detected", po_val_str)
+                        m_col2.metric(f"{supp_doc['type']} Value Detected", doc_val_str)
+                        m_col3.metric("Similarity Match Score", score_str)
+                        
+                        st.markdown(
+                            f'<div class="field-card">'
+                            f'<b>Analysis Detail:</b> {data["detail"]}<br>'
+                            f'<b>Status Category:</b> <code>{status_flag}</code>'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
     else:
         st.warning("Purchase Order document was skipped. Cross-reference comparison requires PO.")
 
@@ -541,25 +595,3 @@ else:
                 type="primary",
             )
         st.caption("Import this CSV directly into EPICOR Data Migration Tool (DMT) for 1-click Receipt Entry creation.")
-
-    st.divider()
-
-    # ── 4. Raw OCR Text & Image Bounding Boxes Inspection ──────────────────────
-    st.markdown("### 📥 Raw OCR Data & Visual Bounding Box Analysis")
-    for doc in st.session_state.docs:
-        source_badge = "🖨️ Scanner" if doc.get("source") == "scanner" else ("📷 Camera" if doc.get("source") == "camera" else "📂 Upload")
-        engine_key = doc.get("engine", "paddle_only")
-        engine_label, _ = _ENGINE_LABELS.get(engine_key, ("🟢 PaddleOCR", "#00c853"))
-        with st.expander(
-            f"{source_badge} | 📄 {doc['type']} — {len(doc['elements'])} lines "
-            f"(confidence: {doc['confidence']:.1%}) | {engine_label}"
-        ):
-            if doc["images"]:
-                boxes = [
-                    el["box"] for el in doc["elements"]
-                    if el.get("box") is not None and len(el["box"]) > 0
-                ]
-                if boxes:
-                    annotated = draw_ocr_boxes(doc["images"][0], boxes)
-                    st.image(annotated, caption=f"{engine_label} Bounding Boxes — {doc['type']}", use_container_width=True)
-            st.code(doc["raw_text"], language=None)
