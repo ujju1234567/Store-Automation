@@ -8,9 +8,21 @@ import datetime
 import streamlit as st
 import tempfile
 from PIL import Image
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(page_title="Incoming Goods Inspection & Store Receiving", layout="wide", page_icon="🏭")
+
+# ─── Compute workspace paths LOCALLY (robust against partial config import) ───
+_BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+_DATABASE_DIR   = os.path.join(_BASE_DIR, "database")
+_SCANNER_DIR    = os.path.join(_BASE_DIR, "scan_inbox")
+_TEMP_CACHE_DIR = os.path.join(_BASE_DIR, "temp_cache")
+_REPORTS_DIR    = os.path.join(_BASE_DIR, "reports")
+
+for _d in [_DATABASE_DIR, _SCANNER_DIR, _TEMP_CACHE_DIR, _REPORTS_DIR]:
+    try:
+        os.makedirs(_d, exist_ok=True)
+    except Exception:
+        pass
 
 # ─── Module imports ───────────────────────────────────────────────────────────
 import config
@@ -85,14 +97,17 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ─── Processing version guard & session init ──────────────────────────────────
-PROCESSING_VERSION = 9
+PROCESSING_VERSION = 10  # Incremented to force fresh session state
+_cfg_db      = getattr(config, "DATABASE_DIR",      _DATABASE_DIR)
+_cfg_scanner = getattr(config, "SCANNER_INBOX_DIR", _SCANNER_DIR)
+
 if st.session_state.get("processing_version") != PROCESSING_VERSION:
     st.session_state.processing_version = PROCESSING_VERSION
     st.session_state.step = 0
     st.session_state.docs = []
     st.session_state.pending_items = []
-    st.session_state.camera_db_folder = config.DATABASE_DIR
-    st.session_state.scanner_inbox = config.SCANNER_INBOX_DIR
+    st.session_state.camera_db_folder = _cfg_db
+    st.session_state.scanner_inbox    = _cfg_scanner
 
 if "step" not in st.session_state:
     st.session_state.step = 0
@@ -101,9 +116,9 @@ if "docs" not in st.session_state:
 if "pending_items" not in st.session_state:
     st.session_state.pending_items = []
 if "camera_db_folder" not in st.session_state:
-    st.session_state.camera_db_folder = config.DATABASE_DIR
+    st.session_state.camera_db_folder = _cfg_db
 if "scanner_inbox" not in st.session_state:
-    st.session_state.scanner_inbox = config.SCANNER_INBOX_DIR
+    st.session_state.scanner_inbox = _cfg_scanner
 
 
 # ─── File & Camera Saving Helpers ──────────────────────────────────────────────
@@ -165,8 +180,12 @@ def _run_ocr_and_extract(images, doc_type):
     }
 
 
-def process_single_item(item):
-    """Processes a pending document (file, camera, or scanner) through OCR."""
+def process_single_item(item, db_folder: str):
+    """Processes a pending document (file, camera, or scanner) through OCR.
+    
+    NOTE: db_folder is passed explicitly — st.session_state is NOT accessible
+    from background threads, and PaddleOCR crashes (0xc000001d) in ThreadPoolExecutor.
+    """
     doc_type = item["type"]
     input_type = item["input_type"]
 
@@ -180,14 +199,15 @@ def process_single_item(item):
         else:
             uploaded_file = file_obj_or_path
             ext = os.path.splitext(uploaded_file.name)[1].lower()
-            with tempfile.NamedTemporaryFile(delete=False, suffix=ext, dir=config.TEMP_CACHE_DIR) as tmp:
+            _tc = getattr(config, "TEMP_CACHE_DIR", _TEMP_CACHE_DIR)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ext, dir=_tc) as tmp:
                 tmp.write(uploaded_file.read())
                 tmp_path = tmp.name
             cleanup_tmp = True
 
         try:
             if ext == ".pdf":
-                images = pdf_to_images(tmp_path, dpi=config.PDF_DPI)
+                images = pdf_to_images(tmp_path, dpi=getattr(config, "PDF_DPI", 120))
             else:
                 with Image.open(tmp_path) as img:
                     images = [img.copy().convert("RGB")]
@@ -200,8 +220,11 @@ def process_single_item(item):
 
         # Save copy to local database folder inside workspace
         saved_db_path = None
-        if images:
-            saved_db_path = save_image_to_db(images[0], doc_type, st.session_state.camera_db_folder)
+        if images and db_folder:
+            try:
+                saved_db_path = save_image_to_db(images[0], doc_type, db_folder)
+            except Exception as _e:
+                print(f"[Warning] Could not save image to DB: {_e}")
 
         res = _run_ocr_and_extract(images, doc_type)
         res["source"] = input_type
@@ -412,26 +435,25 @@ else:
             reset()
             st.rerun()
 
-    # ── Run Parallel OCR Processing if pending ────────────────────────────────
+    # ── Run Sequential OCR Processing if pending ─────────────────────────────
+    # NOTE: ThreadPoolExecutor CANNOT be used here:
+    #   1. st.session_state is inaccessible from background threads.
+    #   2. PaddleOCR crashes with WinError 0xc000001d in thread pools on Windows CPU.
     if st.session_state.pending_items:
         n_items = len(st.session_state.pending_items)
+        db_folder = st.session_state.camera_db_folder  # captured in main thread
+        
         with st.status(f"🚀 Running Redundant Dual-Engine OCR (PaddleOCR + Tesseract) on {n_items} document(s)...", expanded=True) as status:
-            processed_results = [None] * n_items
+            processed_results = []
             
-            max_workers = min(4, n_items)
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_idx = {
-                    executor.submit(process_single_item, item): idx
-                    for idx, item in enumerate(st.session_state.pending_items)
-                }
-                
-                for future in as_completed(future_to_idx):
-                    idx = future_to_idx[future]
-                    try:
-                        res = future.result()
-                        processed_results[idx] = res
-                    except Exception as e:
-                        st.write(f"❌ Error processing document #{idx+1}: {e}")
+            for idx, item in enumerate(st.session_state.pending_items):
+                st.write(f"📄 Processing document {idx+1}/{n_items}: {item['type']}...")
+                try:
+                    res = process_single_item(item, db_folder)
+                    processed_results.append(res)
+                    st.write(f"✅ Done: {item['type']} — confidence {res['confidence']:.1%}")
+                except Exception as e:
+                    st.write(f"❌ Error on document {idx+1} ({item['type']}): {e}")
 
             for r in processed_results:
                 if r is not None:

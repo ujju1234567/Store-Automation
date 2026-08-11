@@ -3,6 +3,17 @@
 !.env.example
 __pycache__/
 *.pyc
+
+# Runtime folders (scanned docs, temp OCR files, reports) — local only
+database/
+temp_cache/
+scan_inbox/
 reports/
+
+# Editor / OS
 .agents/
 .claude/
+.gemini/
+*.log
+Thumbs.db
+.DS_Store
