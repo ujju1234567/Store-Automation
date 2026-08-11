@@ -85,14 +85,14 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ─── Processing version guard & session init ──────────────────────────────────
-PROCESSING_VERSION = 8
+PROCESSING_VERSION = 9
 if st.session_state.get("processing_version") != PROCESSING_VERSION:
     st.session_state.processing_version = PROCESSING_VERSION
     st.session_state.step = 0
     st.session_state.docs = []
     st.session_state.pending_items = []
-    st.session_state.camera_db_folder = r"C:\Users\shailesh\Documents\InspectionImages"
-    st.session_state.scanner_inbox = r"C:\Users\shailesh\Documents\ScanInbox"
+    st.session_state.camera_db_folder = config.DATABASE_DIR
+    st.session_state.scanner_inbox = config.SCANNER_INBOX_DIR
 
 if "step" not in st.session_state:
     st.session_state.step = 0
@@ -101,9 +101,9 @@ if "docs" not in st.session_state:
 if "pending_items" not in st.session_state:
     st.session_state.pending_items = []
 if "camera_db_folder" not in st.session_state:
-    st.session_state.camera_db_folder = r"C:\Users\shailesh\Documents\InspectionImages"
-if "scanner_inbox" not in st.session_state or st.session_state.scanner_inbox == r"C:\ScanInbox":
-    st.session_state.scanner_inbox = r"C:\Users\shailesh\Documents\ScanInbox"
+    st.session_state.camera_db_folder = config.DATABASE_DIR
+if "scanner_inbox" not in st.session_state:
+    st.session_state.scanner_inbox = config.SCANNER_INBOX_DIR
 
 
 # ─── File & Camera Saving Helpers ──────────────────────────────────────────────
@@ -180,7 +180,7 @@ def process_single_item(item):
         else:
             uploaded_file = file_obj_or_path
             ext = os.path.splitext(uploaded_file.name)[1].lower()
-            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ext, dir=config.TEMP_CACHE_DIR) as tmp:
                 tmp.write(uploaded_file.read())
                 tmp_path = tmp.name
             cleanup_tmp = True
@@ -198,9 +198,14 @@ def process_single_item(item):
                 except Exception:
                     pass
 
+        # Save copy to local database folder inside workspace
+        saved_db_path = None
+        if images:
+            saved_db_path = save_image_to_db(images[0], doc_type, st.session_state.camera_db_folder)
+
         res = _run_ocr_and_extract(images, doc_type)
         res["source"] = input_type
-        res["saved_path"] = item.get("saved_path") or (tmp_path if not cleanup_tmp else None)
+        res["saved_path"] = saved_db_path or item.get("saved_path")
         return res
 
     else:

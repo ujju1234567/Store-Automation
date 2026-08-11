@@ -191,7 +191,7 @@ def perform_ocr(pil_image: Image.Image):
     tmp_path = None
 
     try:
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False, dir=_cfg.TEMP_CACHE_DIR) as tmp:
             tmp_path = tmp.name
         pil_image.save(tmp_path, "PNG")
 
