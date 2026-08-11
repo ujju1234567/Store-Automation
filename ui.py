@@ -10,7 +10,7 @@ import tempfile
 from PIL import Image
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-st.set_page_config(page_title="Incoming Goods Inspection", layout="wide", page_icon="🏭")
+st.set_page_config(page_title="Incoming Goods Inspection & Store Receiving", layout="wide", page_icon="🏭")
 
 # ─── Module imports ───────────────────────────────────────────────────────────
 import config
@@ -19,8 +19,11 @@ from ocr import perform_ocr
 from extractor import extract_fields
 from comparison import compare_documents
 from report import export_excel, export_raw_text_excel
+from bin_master import determine_bin_location
+from epicor_receipt import generate_epicor_dmt_receipt_csv, save_to_epicor_network_share
+from scanner_watcher import start_scanner_folder_watcher
 
-# ─── Styling ──────────────────────────────────────────────────────────────────
+# ─── Custom Styling ───────────────────────────────────────────────────────────
 st.markdown("""
 <style>
     div[data-testid="stTabs"] button[data-baseweb="tab"] {
@@ -55,17 +58,34 @@ st.markdown("""
         font-weight: 600;
         margin-bottom: 0.5rem;
     }
+    .bin-card {
+        background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+        border: 2px solid #38bdf8;
+        border-radius: 12px;
+        padding: 1.2rem;
+        color: white;
+        margin: 1rem 0;
+    }
+    .bin-quarantine {
+        background: linear-gradient(135deg, #450a0a 0%, #7f1d1d 100%);
+        border: 2px solid #ef4444;
+        border-radius: 12px;
+        padding: 1.2rem;
+        color: white;
+        margin: 1rem 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 # ─── Processing version guard & session init ──────────────────────────────────
-PROCESSING_VERSION = 5
+PROCESSING_VERSION = 6
 if st.session_state.get("processing_version") != PROCESSING_VERSION:
     st.session_state.processing_version = PROCESSING_VERSION
     st.session_state.step = 0
     st.session_state.docs = []
     st.session_state.pending_items = []
     st.session_state.camera_db_folder = r"C:\Users\shailesh\Documents\InspectionImages"
+    st.session_state.scanner_inbox = r"C:\ScanInbox"
 
 if "step" not in st.session_state:
     st.session_state.step = 0
@@ -75,6 +95,8 @@ if "pending_items" not in st.session_state:
     st.session_state.pending_items = []
 if "camera_db_folder" not in st.session_state:
     st.session_state.camera_db_folder = r"C:\Users\shailesh\Documents\InspectionImages"
+if "scanner_inbox" not in st.session_state:
+    st.session_state.scanner_inbox = r"C:\ScanInbox"
 
 
 # ─── File & Camera Saving Helpers ──────────────────────────────────────────────
@@ -106,7 +128,6 @@ def _run_ocr_and_extract(images, doc_type):
 
     for i, img in enumerate(images):
         result = perform_ocr(img)
-        # Support both old 3-tuple and new 4-tuple return
         if len(result) == 4:
             text, elements, conf, engine = result
         else:
@@ -119,33 +140,42 @@ def _run_ocr_and_extract(images, doc_type):
         engine_counts[engine] = engine_counts.get(engine, 0) + 1
 
     overall_conf = (total_conf / len(images)) if images else 0.0
-    # Primary engine = whichever engine handled most pages
     primary_engine = max(engine_counts, key=engine_counts.get) if engine_counts else "paddle_only"
     extraction = extract_fields(all_text)
 
     return {
-        "type":        doc_type,
-        "images":      images,
-        "raw_text":    all_text,
-        "elements":    all_elements,
-        "confidence":  overall_conf,
-        "extraction":  extraction,
-        "engine":      primary_engine,
+        "type":          doc_type,
+        "images":        images,
+        "raw_text":      all_text,
+        "elements":      all_elements,
+        "confidence":    overall_conf,
+        "extraction":    extraction,
+        "engine":        primary_engine,
         "engine_counts": engine_counts,
     }
 
 
 def process_single_item(item):
-    """Processes a pending document (file or camera) through OCR."""
+    """Processes a pending document (file, camera, or scanner) through OCR."""
     doc_type = item["type"]
     input_type = item["input_type"]
 
-    if input_type == "file":
-        uploaded_file = item["file"]
-        ext = os.path.splitext(uploaded_file.name)[1].lower()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-            tmp.write(uploaded_file.read())
-            tmp_path = tmp.name
+    if input_type in ["file", "scanner"]:
+        file_obj_or_path = item["file"]
+        
+        if isinstance(file_obj_or_path, str):
+            # Scanner file path
+            tmp_path = file_obj_or_path
+            ext = os.path.splitext(tmp_path)[1].lower()
+            cleanup_tmp = False
+        else:
+            # Uploaded File object
+            uploaded_file = file_obj_or_path
+            ext = os.path.splitext(uploaded_file.name)[1].lower()
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                tmp.write(uploaded_file.read())
+                tmp_path = tmp.name
+            cleanup_tmp = True
 
         try:
             if ext == ".pdf":
@@ -154,14 +184,15 @@ def process_single_item(item):
                 with Image.open(tmp_path) as img:
                     images = [img.copy().convert("RGB")]
         finally:
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
+            if cleanup_tmp:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
         res = _run_ocr_and_extract(images, doc_type)
-        res["source"] = "upload"
-        res["saved_path"] = item.get("saved_path")
+        res["source"] = input_type
+        res["saved_path"] = item.get("saved_path") or (tmp_path if not cleanup_tmp else None)
         return res
 
     else:
@@ -185,8 +216,8 @@ def reset():
 
 
 # ─── Header ───────────────────────────────────────────────────────────────────
-st.title("🏭 AI-Powered Incoming Goods Inspection")
-st.markdown("Automate verification of supplier documents against Purchase Orders using AI and PaddleOCR.")
+st.title("🏭 Aerospace Store Receiving & EPICOR ERP Entry System")
+st.markdown("Automated Document Verification, OCR Comparison, EPICOR GRN Receipt Creation, and Shop Floor BIN Assignment.")
 
 doc_types = [
     "Purchase Order",
@@ -206,37 +237,42 @@ if st.session_state.step < len(doc_types):
     )
     st.header(f"📄 {current_doc_type}")
 
-    # ── Folder selection ONLY on Step 1 (Purchase Order) ─────────────────────
+    # ── Configuration Panel on Step 1 (Purchase Order) ───────────────────────
     if st.session_state.step == 0:
-        st.markdown("### 📁 Image Database Storage Folder")
-        st.markdown("Specify the folder path on your laptop where all clicked document images will be saved as a database.")
-        
-        folder_input = st.text_input(
-            "Folder Path",
-            value=st.session_state.camera_db_folder,
-            placeholder=r"e.g. C:\Users\shailesh\Documents\InspectionImages",
-            key="po_folder_input",
-        )
-        if folder_input.strip():
-            st.session_state.camera_db_folder = folder_input.strip()
-            try:
-                os.makedirs(st.session_state.camera_db_folder, exist_ok=True)
-                st.markdown(
-                    f'<div class="folder-info">📂 Active DB Folder: <code>{st.session_state.camera_db_folder}</code></div>',
-                    unsafe_allow_html=True,
-                )
-            except Exception as e:
-                st.error(f"❌ Cannot access folder: {e}")
+        col_c1, col_c2 = st.columns(2)
+        with col_c1:
+            st.markdown("### 📁 Local Database Folder")
+            folder_input = st.text_input(
+                "Folder Path for Image Database",
+                value=st.session_state.camera_db_folder,
+                placeholder=r"e.g. C:\Users\shailesh\Documents\InspectionImages",
+                key="po_folder_input",
+            )
+            if folder_input.strip():
+                st.session_state.camera_db_folder = folder_input.strip()
+
+        with col_c2:
+            st.markdown("### 🖨️ Ricoh fi-8170 Scanner Inbox")
+            scanner_input = st.text_input(
+                "Scanner Hot Folder Path",
+                value=st.session_state.scanner_inbox,
+                placeholder=r"e.g. C:\ScanInbox",
+                key="scanner_folder_input",
+            )
+            if scanner_input.strip():
+                st.session_state.scanner_inbox = scanner_input.strip()
+                os.makedirs(st.session_state.scanner_inbox, exist_ok=True)
+                
         st.divider()
 
     # ── Input mode tabs ────────────────────────────────────────────────────
-    tab_upload, tab_camera = st.tabs(["📂 Upload File", "📷 Camera Capture"])
+    tab_upload, tab_camera, tab_scanner = st.tabs(["📂 Upload File", "📷 Camera Capture", "🖨️ Ricoh fi-8170 Scanner"])
 
     # ── TAB 1: File Upload ─────────────────────────────────────────────────
     with tab_upload:
         uploaded_file = st.file_uploader(
             f"Upload {current_doc_type} (PDF / PNG / JPG)",
-            type=["pdf", "png", "jpg", "jpeg"],
+            type=["pdf", "png", "jpg", "jpeg", "tif", "tiff"],
             key=f"file_{st.session_state.step}",
         )
 
@@ -253,7 +289,7 @@ if st.session_state.step < len(doc_types):
                     next_step()
                     st.rerun()
                 else:
-                    st.warning("Please upload a file first, or switch to Camera Capture.")
+                    st.warning("Please upload a file first, or switch tab.")
 
         with col_skip:
             if st.button("⏭ Skip this document", key=f"skip_upload_{st.session_state.step}"):
@@ -264,8 +300,8 @@ if st.session_state.step < len(doc_types):
     with tab_camera:
         st.markdown(
             '<div class="cam-instruction">'
-            '📷 <b>Fast Capture:</b> Point your camera at the document and click <b>Take Photo</b>. '
-            'The image will be stored instantly into your database folder and queued for fast parallel processing at the end.'
+            '📷 <b>Fast Capture:</b> Point camera at document and click <b>Take Photo</b>. '
+            'Stored instantly into local database folder and queued for processing.'
             '</div>',
             unsafe_allow_html=True,
         )
@@ -308,23 +344,64 @@ if st.session_state.step < len(doc_types):
                 next_step()
                 st.rerun()
 
+    # ── TAB 3: Ricoh fi-8170 Scanner Inbox ─────────────────────────────────
+    with tab_scanner:
+        inbox_folder = st.session_state.scanner_inbox
+        st.markdown(
+            f'<div class="cam-instruction">'
+            f'🖨️ <b>Ricoh fi-8170 Integration:</b> Feed high-res printed documents into scanner.<br>'
+            f'Auto-monitoring inbox folder: <code>{inbox_folder}</code>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        
+        inbox_files = []
+        if os.path.exists(inbox_folder):
+            inbox_files = [
+                os.path.join(inbox_folder, f) for f in os.listdir(inbox_folder)
+                if os.path.splitext(f)[1].lower() in [".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff"]
+            ]
+            
+        if inbox_files:
+            selected_scan = st.selectbox(
+                f"Select scanned file for {current_doc_type}",
+                options=inbox_files,
+                format_func=os.path.basename,
+                key=f"scan_select_{st.session_state.step}"
+            )
+            
+            if st.button("✅ Ingest Scanned Document", type="primary", key=f"confirm_scan_{st.session_state.step}"):
+                st.session_state.pending_items.append({
+                    "type": current_doc_type,
+                    "input_type": "scanner",
+                    "file": selected_scan,
+                    "saved_path": selected_scan
+                })
+                st.toast(f"🖨️ Ingested scan: {os.path.basename(selected_scan)}", icon="📥")
+                next_step()
+                st.rerun()
+        else:
+            st.info(f"Scanning folder `{inbox_folder}` is currently empty. Drop scanned files here or use Ricoh PaperStream scanner.")
+            if st.button("⏭ Skip this document", key=f"skip_scanner_{st.session_state.step}"):
+                next_step()
+                st.rerun()
+
 else:
-    # ── Final Processing & Results Page ───────────────────────────────────────
-    st.header("📋 Inspection Results")
+    # ── Final Processing, Verification & Store Receiving Results Page ──────────
+    st.header("📋 Aerospace Store Receiving Results")
 
     col_r, col_s = st.columns([2, 8])
     with col_r:
-        if st.button("🔄 Start Over"):
+        if st.button("🔄 Start New Receiving Batch"):
             reset()
             st.rerun()
 
     # ── Run Parallel OCR Processing if pending ────────────────────────────────
     if st.session_state.pending_items:
         n_items = len(st.session_state.pending_items)
-        with st.status(f"🚀 Running Adaptive OCR (PaddleOCR + Tesseract) on {n_items} document(s)...", expanded=True) as status:
+        with st.status(f"🚀 Running Adaptive Dual-Engine OCR (PaddleOCR + Tesseract) on {n_items} document(s)...", expanded=True) as status:
             processed_results = [None] * n_items
             
-            # Execute OCR in parallel threads
             max_workers = min(4, n_items)
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_idx = {
@@ -344,12 +421,10 @@ else:
                     except Exception as e:
                         st.write(f"❌ Error processing document #{idx+1}: {e}")
 
-            # Collect non-None results
             for r in processed_results:
                 if r is not None:
                     st.session_state.docs.append(r)
             
-            # Clear pending queue
             st.session_state.pending_items = []
             status.update(label="🎉 All OCR processing completed (adaptive dual-engine)!", state="complete", expanded=False)
 
@@ -358,80 +433,121 @@ else:
         st.stop()
 
     po_doc = next((d for d in st.session_state.docs if d["type"] == "Purchase Order"), None)
+    po_number = po_doc["extraction"].po_number if po_doc else "12345"
 
-    # ── Captured image database summary ──────────────────────────────────────
-    camera_docs = [d for d in st.session_state.docs if d.get("source") == "camera"]
-    if camera_docs and st.session_state.camera_db_folder:
-        st.success(
-            f"📷 **{len(camera_docs)} camera image(s)** saved to local database: `{st.session_state.camera_db_folder}`"
+    # ── 1. Document Comparison & High-Precision Match Analysis ───────────────
+    st.markdown("### 🔍 High-Precision Document Matching & Word-for-Word Analysis")
+    
+    is_overall_approved = True
+    overall_match_pcts = []
+    
+    if po_doc:
+        supporting_docs = [d for d in st.session_state.docs if d["type"] != "Purchase Order"]
+        if supporting_docs:
+            for supp_doc in supporting_docs:
+                st.subheader(f"📄 PO vs {supp_doc['type']}")
+                results = compare_documents(po_doc["extraction"], supp_doc["extraction"])
+                summary = results.pop("_summary", {})
+                
+                match_pct = summary.get("overall_match_pct", 0.0)
+                overall_match_pcts.append(match_pct)
+                approved = summary.get("is_approved", False)
+                if not approved:
+                    is_overall_approved = False
+
+                col_m1, col_m2 = st.columns(2)
+                col_m1.metric("Similarity Matching Confidence", f"{match_pct:.1f}%")
+                col_m2.metric("Compliance Status", "✅ APPROVED" if approved else "❌ REJECTED")
+
+                # Field details
+                for field, data in results.items():
+                    status_flag = data["status"]
+                    icon = "✅" if status_flag == "match" else "⚠️" if "partial" in status_flag else "❌"
+                    st.markdown(
+                        f"**{field.replace('_', ' ').title()}**: {icon} {data['detail']} "
+                        f"(PO: *{data['base'] or 'Not found'}* | Doc: *{data['supporting'] or 'Not found'}*)"
+                    )
+    else:
+        st.warning("Purchase Order document was skipped. Cross-reference comparison requires PO.")
+
+    st.divider()
+
+    # ── 2. Shop Floor Worker BIN Assignment Card ──────────────────────────────
+    st.markdown("### 📦 Shop Floor Worker BIN Location Recommendation")
+    
+    sample_ext = po_doc["extraction"].model_dump() if po_doc else {}
+    bin_info = determine_bin_location(sample_ext, is_approved=is_overall_approved)
+    
+    if bin_info["status"] == "APPROVED":
+        st.markdown(
+            f'<div class="bin-card">'
+            f'<h2>✅ APPROVED RECEIVING — MOVE TO BIN</h2>'
+            f'<h3>📍 Assigned BIN Location: <code>{bin_info["bin"]}</code></h3>'
+            f'<p><b>Warehouse Zone:</b> {bin_info["zone"]}<br>'
+            f'<b>Rack / Drawer:</b> {bin_info["rack"]}<br>'
+            f'<b>Instruction:</b> {bin_info["instruction"]}</p>'
+            f'</div>',
+            unsafe_allow_html=True
         )
-        saved_files = [d.get("saved_path") for d in camera_docs if d.get("saved_path")]
-        if saved_files:
-            with st.expander("🗂️ View saved image database files"):
-                for p in saved_files:
-                    st.markdown(f"- `{p}`")
+    else:
+        st.markdown(
+            f'<div class="bin-quarantine">'
+            f'<h2>⚠️ QUARANTINE / INSPECTION HOLD</h2>'
+            f'<h3>📍 Target Bin: <code>{bin_info["bin"]}</code></h3>'
+            f'<p><b>Zone:</b> {bin_info["zone"]}<br>'
+            f'<b>Reason:</b> {bin_info["reason"]}<br>'
+            f'<b>Action Required:</b> {bin_info["instruction"]}</p>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
 
-    # ── 1. Raw OCR text dump ───────────────────────────────────────────────────
-    st.markdown("### 📥 Raw OCR Text Export")
+    st.divider()
 
-    report_dir = os.path.join(os.path.dirname(__file__), "reports")
-    os.makedirs(report_dir, exist_ok=True)
-    raw_excel_path = os.path.join(report_dir, "all_raw_text.xlsx")
+    # ── 3. EPICOR ERP Receipt Entry & DMT CSV Exporter ─────────────────────────
+    st.markdown("### ⚡ EPICOR ERP On-Premise Integration & Goods Receipt (GRN)")
+    
+    col_e1, col_e2 = st.columns(2)
+    
+    with col_e1:
+        st.markdown("#### 1. EPICOR Shared Network Folder Upload")
+        share_folder = st.text_input("EPICOR Network Share Path", value=r"C:\Users\shailesh\Desktop\Ujjval\01-Automation\99-\reports\epicor_attachments")
+        if st.button("📁 Stream Attachments to EPICOR Share"):
+            saved_paths = []
+            for d in st.session_state.docs:
+                p = save_to_epicor_network_share(d["images"], po_number, d["type"], share_folder)
+                saved_paths.append(p)
+            st.success(f"✅ Saved {len(saved_paths)} document evidence file(s) to EPICOR share path!")
+            for p in saved_paths:
+                st.markdown(f"- `{p}`")
 
-    txt_path = export_raw_text_excel(st.session_state.docs, raw_excel_path)
-
-    col_e, col_t = st.columns(2)
-    with col_e:
-        with open(raw_excel_path, "rb") as f:
+    with col_e2:
+        st.markdown("#### 2. EPICOR Receipt Entry (DMT CSV Exporter)")
+        report_dir = os.path.join(os.path.dirname(__file__), "reports")
+        dmt_csv_path = os.path.join(report_dir, f"epicor_dmt_receipt_PO_{po_number}.csv")
+        
+        generate_epicor_dmt_receipt_csv(st.session_state.docs, po_number, dmt_csv_path)
+        
+        with open(dmt_csv_path, "rb") as f:
             st.download_button(
-                "📊 Download OCR Text (Excel)",
+                "📦 Download EPICOR Receipt DMT CSV",
                 f,
-                file_name="all_raw_text.xlsx",
+                file_name=os.path.basename(dmt_csv_path),
                 type="primary",
             )
-    with col_t:
-        with open(txt_path, "rb") as f:
-            st.download_button(
-                "📄 Download OCR Text (TXT)",
-                f,
-                file_name="all_raw_text.txt",
-            )
+        st.caption("Import this CSV directly into EPICOR Data Migration Tool (DMT) for 1-click Receipt Entry creation.")
 
-    # ── Show OCR text & Bounding Box preview per doc ──────────────────────────
-    st.markdown("#### 🔍 OCR Text & Image Analysis (Per Document)")
+    st.divider()
+
+    # ── 4. Raw OCR Text & Image Bounding Boxes Inspection ──────────────────────
+    st.markdown("### 📥 Raw OCR Data & Visual Bounding Box Analysis")
     for doc in st.session_state.docs:
-        source_badge = "📷 Camera" if doc.get("source") == "camera" else "📂 Upload"
+        source_badge = "🖨️ Scanner" if doc.get("source") == "scanner" else ("📷 Camera" if doc.get("source") == "camera" else "📂 Upload")
         engine_key = doc.get("engine", "paddle_only")
-        engine_label, engine_color = _ENGINE_LABELS.get(engine_key, ("🟢 PaddleOCR", "#00c853"))
+        engine_label, _ = _ENGINE_LABELS.get(engine_key, ("🟢 PaddleOCR", "#00c853"))
         with st.expander(
             f"{source_badge} | 📄 {doc['type']} — {len(doc['elements'])} lines "
             f"(confidence: {doc['confidence']:.1%}) | {engine_label}"
         ):
-            metric_a, metric_b, metric_c, metric_d = st.columns(4)
-            metric_a.metric("Text elements", len(doc["elements"]))
-            metric_b.metric("OCR confidence", f"{doc['confidence']:.1%}")
-            metric_c.metric("Pages / Images", len(doc["images"]))
-            metric_d.metric("OCR engine", engine_label)
-
-            # Show engine breakdown if multiple pages used different engines
-            engine_counts = doc.get("engine_counts", {})
-            if len(engine_counts) > 1:
-                breakdown = ", ".join(
-                    f"{_ENGINE_LABELS.get(e, (e, ''))[0]}: {c} page(s)"
-                    for e, c in engine_counts.items()
-                )
-                st.info(f"🔀 **Adaptive OCR per-page breakdown:** {breakdown}")
-            elif engine_key == "tesseract":
-                st.info("🔵 **Tesseract was used** — PaddleOCR confidence was below threshold on this document.")
-            elif engine_key == "paddle":
-                st.success("🟢 **PaddleOCR** delivered high-confidence results — no fallback needed.")
-            else:
-                st.info("🟢 **PaddleOCR** — Tesseract not installed; running in Paddle-only mode.")
-
-            if doc.get("saved_path"):
-                st.markdown(f"💾 Saved to database: `{doc['saved_path']}`")
-
-            # Draw bounding boxes on photo/image
             if doc["images"]:
                 boxes = [
                     el["box"] for el in doc["elements"]
@@ -440,51 +556,4 @@ else:
                 if boxes:
                     annotated = draw_ocr_boxes(doc["images"][0], boxes)
                     st.image(annotated, caption=f"{engine_label} Bounding Boxes — {doc['type']}", use_container_width=True)
-                else:
-                    st.image(doc["images"][0], caption=f"Captured Image — {doc['type']}", use_container_width=True)
-
-            if doc["elements"]:
-                st.code(doc["raw_text"], language=None)
-            else:
-                st.error("OCR returned no text for this document. Verify readable content.")
-
-            extracted = {
-                field.replace("_", " ").title(): value
-                for field, value in doc["extraction"].model_dump().items()
-                if value not in (None, "")
-            }
-            st.markdown("**Extracted document details**")
-            if extracted:
-                st.json(extracted)
-            else:
-                st.warning("No labeled fields were found. Raw OCR text is used for comparison.")
-
-    # ── 2. Cross-reference (requires PO + supporting docs) ───────────────────
-    if po_doc:
-        supporting_docs = [d for d in st.session_state.docs if d["type"] != "Purchase Order"]
-        if supporting_docs:
-            st.markdown("### 🔍 Cross-Reference Verification (PO vs Documents)")
-            for supp_doc in supporting_docs:
-                source_badge = "📷" if supp_doc.get("source") == "camera" else "📂"
-                st.subheader(f"{source_badge} PO vs {supp_doc['type']}")
-                results = compare_documents(po_doc["extraction"], supp_doc["extraction"])
-                for field, data in results.items():
-                    status = data["status"]
-                    icon = "✅" if status == "match" else "❌" if "mismatch" in status else "⚠️"
-                    st.markdown(
-                        f"**{field.replace('_', ' ').title()}**: {icon} {data['detail']} "
-                        f"(PO: *{data['base'] or 'Not found'}* | Doc: *{data['supporting'] or 'Not found'}*)"
-                    )
-
-                # Comparison Excel export
-                excel_path = os.path.join(
-                    report_dir,
-                    f"comparison_{supp_doc['type'].replace(' ', '_').replace('(', '').replace(')', '')}.xlsx"
-                )
-                export_excel(results, excel_path)
-                with open(excel_path, "rb") as f:
-                    st.download_button(
-                        f"📊 Download Comparison: {supp_doc['type']}",
-                        f,
-                        file_name=os.path.basename(excel_path),
-                    )
+            st.code(doc["raw_text"], language=None)
