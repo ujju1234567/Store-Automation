@@ -96,7 +96,7 @@ if "pending_items" not in st.session_state:
 if "camera_db_folder" not in st.session_state:
     st.session_state.camera_db_folder = r"C:\Users\shailesh\Documents\InspectionImages"
 if "scanner_inbox" not in st.session_state:
-    st.session_state.scanner_inbox = r"C:\ScanInbox"
+    st.session_state.scanner_inbox = r"C:\Users\shailesh\Documents\ScanInbox"
 
 
 # ─── File & Camera Saving Helpers ──────────────────────────────────────────────
@@ -256,12 +256,15 @@ if st.session_state.step < len(doc_types):
             scanner_input = st.text_input(
                 "Scanner Hot Folder Path",
                 value=st.session_state.scanner_inbox,
-                placeholder=r"e.g. C:\ScanInbox",
+                placeholder=r"e.g. C:\Users\shailesh\Documents\ScanInbox",
                 key="scanner_folder_input",
             )
             if scanner_input.strip():
                 st.session_state.scanner_inbox = scanner_input.strip()
-                os.makedirs(st.session_state.scanner_inbox, exist_ok=True)
+                try:
+                    os.makedirs(st.session_state.scanner_inbox, exist_ok=True)
+                except Exception as e:
+                    st.warning(f"Note: Unable to create folder `{st.session_state.scanner_inbox}` ({e})")
                 
         st.divider()
 

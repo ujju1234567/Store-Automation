@@ -26,8 +26,11 @@ class ScannerHotFolderHandler(FileSystemEventHandler):
 
 def start_scanner_folder_watcher(folder_path: str, callback_func):
     """Starts watching the specified scanner folder in the background."""
-    if not os.path.exists(folder_path):
-        os.makedirs(folder_path, exist_ok=True)
+    try:
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path, exist_ok=True)
+    except Exception as e:
+        print(f"[Scanner Watcher Warning] Could not create {folder_path}: {e}")
         
     event_handler = ScannerHotFolderHandler(callback_func)
     observer = Observer()
